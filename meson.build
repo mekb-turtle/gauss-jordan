@@ -10,7 +10,7 @@ main_name = 'gauss-jordan'
 
 # define source files
 src_main = files('src' / 'main.c')
-src = files('src'/'gauss-jordan.c')
+src = files('src'/'gauss-jordan.c', 'src'/'gauss-jordan.h', 'src'/'rational.c', 'src'/'rational.h')
 
 # define project metadata
 url = 'https://github.com/mekb-turtle/gauss-jordan'
