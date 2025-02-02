@@ -13,7 +13,7 @@
 #define eprintf(...) fprintf(stderr, __VA_ARGS__)
 
 struct matrix {
-	rational **matrix;
+	rational *matrix;
 	int m, n;
 };
 
@@ -22,14 +22,20 @@ static struct numlist {
 	struct numlist *next;
 } *tmplist = NULL, *tmplist_tail = NULL;
 
-static void *get(int x, int y, void *data) {
+rational *matrix_get(struct matrix matrix, int row, int col) {
+	if (col < 0 || row < 0 || col >= matrix.n || row >= matrix.m) return NULL;
+	return &matrix.matrix[row * matrix.n + col];
+}
+
+static void *get(int row, int col, void *data) {
 	struct matrix *matrix = (struct matrix *) data;
-	if (x < 0 || y < 0 || x >= matrix->m || y >= matrix->n) raise(SIGABRT);
+	rational *v = matrix_get(*matrix, row, col);
+	if (!v) raise(SIGABRT);
 
 	// create copy of value to avoid old values in pointers
 	struct numlist *num = malloc(sizeof(struct numlist));
 	if (!num) raise(SIGABRT);
-	num->value = matrix->matrix[x][y];
+	num->value = *v;
 	if (tmplist_tail) {
 		tmplist_tail->next = num;
 		tmplist_tail = num;
@@ -47,11 +53,14 @@ static void free_tmplist() {
 	}
 }
 
-static void set(int x, int y, void *value_, void *data) {
+static void set(int row, int col, void *value_, void *data) {
 	rational value = *(rational *) value_;
 	struct matrix *matrix = (struct matrix *) data;
-	if (x < 0 || y < 0 || x >= matrix->m || y >= matrix->n) raise(SIGABRT);
-	matrix->matrix[x][y] = value;
+
+	rational *v = matrix_get(*matrix, row, col);
+	if (!v) raise(SIGABRT);
+
+	*v = value;
 }
 
 // void* math functions
@@ -84,171 +93,262 @@ static int m_nonzero(void *a_) {
 
 char *letters[] = {"x", "y", "z", "w", "v", "u", "t", "s", "r"};
 
-static int frac_places(double x) {
-	if (!isfinite(x)) return 0;
-	x = fabs(x);
-	x = fmod(x, 1); // get fractional part
-
-	int places;
-	for (places = 0; x > 1e-12 && places < 10; ++places) {
-		x *= 10.0;      // shift decimal point
-		x = fmod(x, 1); // get fractional part
-	}
-	return places;
-}
-
-#define FRAC(x) (frac_places(x)), (x)
-
 struct display_settings {
-	bool frac;
+	bool frac, latex;
 };
 
+struct digit_add_data {
+	char *fmt;
+	size_t len;
+	int *fmt_len;
+	bool first, reoccuring;
+	struct display_settings settings;
+};
+
+static bool write_digit(int digit, bool is_reoccuring, void *data) {
+	int res;
+	size_t max_len_tmp;
+	struct digit_add_data *d = (struct digit_add_data *) data;
+
+#define PRINT(...) (max_len_tmp = d->len - *d->fmt_len, res = snprintf(d->fmt + *d->fmt_len, max_len_tmp, __VA_ARGS__), *d->fmt_len += res)
+#define RES() \
+	if (!(res >= 0 && (size_t) res < max_len_tmp)) return false
+
+	if (d->first) {
+		// write decimal point
+		PRINT(".");
+		RES();
+		d->first = false;
+	}
+	if (!d->reoccuring && is_reoccuring) {
+		if (d->settings.latex) PRINT("\\overline{"); // start overline
+		else
+			PRINT("("); // opening bracket
+		RES();
+		d->reoccuring = true;
+	}
+	PRINT("%d", digit);
+	RES();
+	return true;
+#undef PRINT
+#undef RES
+}
+
 static void print_d(rational d, struct display_settings settings, bool first, bool one, bool space, int pad, FILE *out, int *len) {
+	if (settings.latex) {
+		pad = 0;
+		space = false;
+	}
+
 	d = r_simplify(d);
-
-	bool is_negative = (d.num < 0) != (d.den < 0);
-
-	if (d.num < 0) d.num = -d.num;
-	if (d.den < 0) d.den = -d.den;
+	bool is_neg = r_is_negative(d);
+	d = r_abs(d);
 
 	char fmt[64] = {0};
-	int r;
+	int fmt_len = 0, res = 0;
+	size_t max_len_tmp = 0;
 
-#define PRINT(...) r = snprintf(fmt, sizeof(fmt), __VA_ARGS__)
+#define PRINT(...) (max_len_tmp = sizeof(fmt) - fmt_len, res = snprintf(fmt + fmt_len, max_len_tmp, __VA_ARGS__), fmt_len += res)
+#define RES() \
+	if (!(res >= 0 && (size_t) res < max_len_tmp)) goto invalid
 	if (d.den == 1) {
-		if (!one) {
+		if (d.num == 1 && !one) {
 			fmt[0] = '\0';
-			r = 0;
+			res = fmt_len = 0;
+			max_len_tmp = 1;
 		} else {
 			// print as integer
 			PRINT("%d", d.num);
 		}
 	} else if (d.den == 0)
-		PRINT("inf");
+		PRINT(settings.latex ? "\\infty" : "inf");
 	else if (d.num == 0)
 		PRINT("0");
-	else if (settings.frac) {
+	else if (settings.frac)
 		// print as fraction
-		PRINT("%d/%d", d.num, d.den);
-	} else {
-		// print with fractional places
-		double f = (double) d.num / d.den;
-		PRINT("%.*f", FRAC(f));
-	}
-#undef PRINT
+		PRINT(settings.latex ? "\\tfrac{%d}{%d}" : "%d/%d", d.num, d.den);
+	else {
+		// print as fractional digits
+		int int_part = r_get_integer(d);
+		PRINT("%d", int_part);
+		RES();
 
-	if (r < 0 || (size_t) r >= sizeof(fmt)) {
-		if (out) fprintf(out, "?");
-		if (len) *len = 1;
-		return;
+		struct digit_add_data ctx = {fmt, sizeof(fmt), &fmt_len, true, false, settings};
+
+		// printf("DECOMPOSE: %d %d %d\n", d.num, d.den, is_reoccuring(d));
+		if (!r_decompose(d, write_digit, &ctx)) goto invalid;
+		if (ctx.reoccuring) {
+			if (settings.latex)
+				PRINT("}"); // close overline
+			else
+				PRINT(")"); // closing bracket
+		}
 	}
+
+	RES();
+#undef PRINT
+#undef RES
 
 	// calculate padding
-	if (space && !first) ++r;
+	if (space && !first) ++fmt_len;
 
-	if (len) *len = r;
+	if (len) *len = fmt_len;
 	if (!out) return;
 
-	if (r > pad) pad = 0;
+	if (fmt_len > pad) pad = 0;
 	else
-		pad -= r;
+		pad -= fmt_len;
 
 	// print padding
 	for (int i = 0; i < pad; ++i)
 		fprintf(out, " ");
 
 	// print sign
-	if (is_negative)
+	if (is_neg)
 		fprintf(out, "-");
-	else if (!first)
-		fprintf(out, one ? " " : "+");
+	else if (!first) {
+		if (!one) fprintf(out, "+");
+		else if (!settings.latex)
+			fprintf(out, " ");
+	}
 
 	if (space && !first)
 		fprintf(out, " ");
 
-	fprintf(out, "%s", fmt);
+	fwrite(fmt, 1, fmt_len, out);
+	return;
+
+invalid:
+	if (out) fprintf(out, "?");
+	if (len) *len = 1;
+	return;
 }
 
 void print_matrix(struct matrix mat, struct display_settings settings) {
 	int lens[mat.n];
-	for (int j = 0; j < mat.n; ++j) {
-		lens[j] = 0;
-		for (int i = 0; i < mat.m; ++i) {
+	for (int col = 0; col < mat.n; ++col) {
+		lens[col] = 0;
+		if (settings.latex) continue; // no need for padding
+		for (int row = 0; row < mat.m; ++row) {
 			// calculate padding required for each column
 			int cur = 0;
-			rational *v = get(i, j, &mat);
-			print_d(*v, settings, false, true, false, lens[j], NULL, &cur);
-			if (cur > lens[j]) lens[j] = cur;
+			rational *v = matrix_get(mat, row, col);
+			if (!v) raise(SIGABRT);
+			print_d(*v, settings, false, true, false, 0, NULL, &cur);
+			if (cur > lens[col]) lens[col] = cur;
 		}
 	}
-	for (int i = 0; i < mat.m; ++i) {
-		bool top = i == 0, bottom = i == mat.m - 1;
+	if (settings.latex) {
+		printf("\\[\\left[\\begin{array}{");
+		for (int i = 0; i < mat.m; ++i)
+			printf("c");
+		// specify where augment line is
+		if (mat.n > mat.m)
+			printf("|");
+		for (int i = mat.m; i < mat.n; ++i)
+			printf("c");
+		printf("}");
+	}
+	for (int row = 0; row < mat.m; ++row) {
+		bool top = row == 0, bottom = row == mat.m - 1;
 #define BORDER(top_, middle_, bottom_) (top ? top_ : bottom ? bottom_ \
 	                                                        : middle_)
-		printf("%s", BORDER("┌", "│", "└"));
-		for (int j = 0; j < mat.n; ++j) {
-			rational *v = get(i, j, &mat);
-			if (j == mat.m) printf(" %s", BORDER("╷", "│", "╵"));
-			if (j != 0) printf(" ");
-			print_d(*v, settings, false, true, false, lens[j], stdout, NULL);
+		if (!settings.latex) printf("%s", BORDER("┌", "│", "└"));
+		for (int col = 0; col < mat.n; ++col) {
+			if (settings.latex) {
+				if (col > 0) printf("&");
+			} else {
+				if (col == mat.m) printf(" %s", BORDER("╷", "│", "╵"));
+				if (col != 0) printf(" ");
+			}
+
+			int cur = 0;
+			rational *v = matrix_get(mat, row, col);
+			if (!v) raise(SIGABRT);
+			print_d(*v, settings, false, true, false, lens[col], stdout, &cur);
+		}
+		if (settings.latex) {
+			printf("\\\\");
+			continue;
 		}
 		printf(" %s", BORDER("┐", "│", "┘"));
 		printf("\n");
 	}
+	if (settings.latex) printf("\\end{array}\\right]\\]");
 	printf("\n");
 }
 
 void print_system(struct matrix mat, struct display_settings settings) {
-	for (int i = 0; i < mat.m; ++i) {
+	if (settings.latex) printf("\\[\\begin{cases}");
+	for (int row = 0; row < mat.m; ++row) {
 		bool first = true;
 		bool term = false;
-		for (int j = 0, l = 0; j < mat.n; ++j) {
-			rational *v = get(i, j, &mat);
+		for (int col = 0, l = 0; col < mat.n; ++col) {
+			rational *v = matrix_get(mat, row, col);
+			if (!v) raise(SIGABRT);
 
-			if (j == mat.m) {
+			if (col == mat.m) {
 				first = true;
 				if (!term) {
-					printf("0 "); // if no terms
+					printf("0"); // if no terms
+					if (!settings.latex) printf(" ");
 				}
-				printf("= ");
+				printf("=");
+				if (!settings.latex) printf(" ");
 			}
 			if (v->num == 0) goto inc_l;
 
 			// print coefficient
-			print_d(*v, settings, first, j == mat.m, true, 0, stdout, NULL);
+			print_d(*v, settings, first, col == mat.m, true, 0, stdout, NULL);
 			first = false;
 
-			if (j != mat.m) {
+			if (col != mat.m) {
 				if ((size_t) l >= sizeof(letters) / sizeof(letters[0])) {
 					// prevent out of bounds
 					printf("?");
 					continue;
 				}
-				printf("%s ", letters[l]);
-				if (j < mat.m) term = true;
+				printf("%s", letters[l]);
+				if (!settings.latex) printf(" ");
+				if (col < mat.m) term = true;
 			inc_l:
 				++l;
-			} else
+			} else if (!settings.latex)
 				printf(" ");
 		}
-		printf("\n");
+		if (settings.latex) {
+			if (row != mat.m - 1) printf("\\\\");
+		} else
+			printf("\n");
 	}
+	if (settings.latex) printf("\\end{cases}\\]");
 	printf("\n");
 }
 
-#define ROW(...) ((rational[]) {__VA_ARGS__})
+void clone_matrix(struct matrix src, struct matrix *dest) {
+	dest->m = src.m;
+	dest->n = src.n;
+	for (int row = 0; row < src.m; ++row)
+		for (int col = 0; col < src.n; ++col) {
+			rational *v = get(row, col, &src);
+			if (!v) raise(SIGABRT);
+			set(row, col, v, dest);
+		}
+}
+
 #define F(x, y) ((rational) {(x), (y)})
 
 int main(int argc, char *argv[]) {
 	int opt;
 	bool invalid = false;
-	struct display_settings settings = {.frac = true};
+	struct display_settings settings = {.frac = true, .latex = false};
 
 	// argument handling
-	while ((opt = getopt_long(argc, argv, ":hVf", (struct option[]) {
+	while ((opt = getopt_long(argc, argv, ":hVfl", (struct option[]) {
 	                                                       {"help",        no_argument, 0, 'h'},
 	                                                       {"version",     no_argument, 0, 'V'},
 	                                                       {"no-fraction", no_argument, 0, 'f'},
+	                                                       {"latex",       no_argument, 0, 'l'},
 	                                                       {0,             0,           0, 0  }
     },
 	                          NULL)) != -1) {
@@ -261,6 +361,7 @@ int main(int argc, char *argv[]) {
 				printf("-h --help: Shows help text\n");
 				printf("-V --version: Shows the version\n");
 				printf("-f --no-fraction: Print decimal numbers instead of fractions\n");
+				printf("-l --latex: Print matrices and systems in LaTeX format\n");
 				return 0;
 			case 'V':
 				printf("%s %s\n", PROJECT_NAME, PROJECT_VERSION);
@@ -273,6 +374,9 @@ int main(int argc, char *argv[]) {
 				switch (opt) {
 					case 'f':
 						settings.frac = false;
+						break;
+					case 'l':
+						settings.latex = true;
 						break;
 					default:
 						invalid = true;
@@ -287,17 +391,19 @@ int main(int argc, char *argv[]) {
 	}
 
 	struct matrix mat = {
-	        (rational *[]) {
-	                        ROW(F(2, 1), F(-3, 1), F(4, 1), F(6, 1), F(2, 1)),
-	                        ROW(F(3, 1), F(4, 1), F(-5, 1), F(7, 1), F(1, 1)),
-	                        ROW(F(4, 1), F(-5, 1), F(6, 1), F(8, 1), F(-9, 1))},
-	        .m = 3, .n = 4
+	        (rational[]) {
+	                      F(2, 1), F(-3, 1), F(6, -1), F(6, 1), F(2, 1),
+	                      F(3, 1), F(4, 1), F(-5, 1), F(7, 1), F(1, 1),
+	                      F(4, 1), F(-5, 1), F(6, 1), F(8, 1), F(-9, 1)},
+	        .m = 3, .n = 5
     };
 
 	if (mat.n < mat.m) return 1;
 
-	print_system(mat, settings);
-	print_matrix(mat, settings);
+	struct matrix old_mat;
+	rational old_mat_[mat.m * mat.n];
+	old_mat.matrix = old_mat_;
+	clone_matrix(mat, &old_mat);
 
 	int r = gauss_jordan(get, set, m_sub, m_mul, m_div, m_nonzero, mat.m, mat.n, &mat);
 	if (r < 0) {
@@ -306,20 +412,27 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	print_system(old_mat, settings);
+	print_matrix(old_mat, settings);
+
 	print_matrix(mat, settings);
 	print_system(mat, settings);
 
 	bool identity = true;
 
-	for (int i = 0; i < mat.m; ++i)
-		for (int j = 0; j < mat.m; ++j) {
-			rational *g = get(i, j, &mat);
+	for (int row = 0; row < mat.m; ++row)
+		for (int col = 0; col < mat.m; ++col) {
+			rational *g = matrix_get(mat, row, col);
+			if (!g) raise(SIGABRT);
 			// check if the matrix is the identity matrix
-			if (g->num != (i == j ? g->den : 0.0))
+			if (g->num != (row == col ? g->den : 0.0))
 				identity = false;
 		}
 
-	printf("%solution found\n", identity ? "S" : "No s");
+	if (settings.latex) printf("\\[\\text{");
+	printf("%solution found", identity ? "S" : "No s");
+	if (settings.latex) printf("}\\]");
+	printf("\n");
 
 	free_tmplist();
 
