@@ -159,8 +159,12 @@ inline rational r_inverse(rational a) {
 }
 
 static inline int pow_(int base, int exp) {
-	int power = base;
-	for (; exp > 0; --exp) power *= base;
+	int power = 1;
+	while (exp > 0) {
+		if (exp % 2 == 1) power *= base;
+		base *= base;
+		exp /= 2;
+	}
 	return power;
 }
 
